@@ -8349,6 +8349,17 @@ func isSpreadIntoCallOrNew(node *ast.Node) bool {
 }
 
 func (c *Checker) checkQualifiedName(node *ast.Node, checkMode CheckMode) *Type {
+	// A '#' JSDoc link (Foo#member) refers to an instance member. Resolving
+	// it as a qualified name would find (and cache) the static member
+	// instead, so resolve it as a JSDoc member name and record that symbol.
+	// The link itself has no type, matching TS 6, where a JSDocMemberName
+	// node is not checked as an expression.
+	if ast.IsJSDocMemberName(node) {
+		if symbol := c.resolveJSDocMemberName(node); symbol != nil {
+			c.symbolNodeLinks.Get(node).resolvedSymbol = symbol
+		}
+		return c.errorType
+	}
 	left := node.AsQualifiedName().Left
 	var leftType *Type
 	if ast.IsPartOfTypeQuery(node) && ast.IsThisIdentifier(left) {
@@ -32822,6 +32833,12 @@ func (c *Checker) getSymbolOfNameOrPropertyAccessExpression(name *ast.Node) *ast
 		} else if ast.IsPrivateIdentifier(name) {
 			return c.getSymbolForPrivateIdentifierExpression(name)
 		} else if ast.IsPropertyAccessExpression(name) || ast.IsQualifiedName(name) {
+			// A '#' JSDoc link (Foo#member) refers to an instance member.
+			// Resolve it before consulting the symbol cache: GetTypeAtLocation
+			// may have cached the static member there first.
+			if isJSDoc && ast.IsJSDocMemberName(name) {
+				return c.resolveJSDocMemberName(name)
+			}
 			links := c.symbolNodeLinks.Get(name)
 			if links.resolvedSymbol != nil {
 				return links.resolvedSymbol

@@ -277,6 +277,157 @@ class Foo {
 	}
 }
 
+func TestGetSymbolAtLocationJSDocHashLinkTypeThenSymbol(t *testing.T) {
+	t.Parallel()
+
+	// A '#'-link must resolve the same way no matter which API is called
+	// first. In particular, GetTypeAtLocation must not cache the static
+	// member where a later GetSymbolAtLocation would find it.
+	cases := []struct {
+		name    string
+		content string
+		seeTag  bool
+		resolve string // "instance", "static", or "none"
+		typ     string
+	}{
+		{
+			name: "hash link, both members",
+			content: `/**
+ * {@link Foo.member | static}
+ * {@link Foo#member | instance}
+ */
+class Foo {
+    static member = 123;
+    member = 456;
+}
+`,
+			resolve: "instance",
+			typ:     "any",
+		},
+		{
+			name: "hash link, static only member resolves to nothing",
+			content: `/** {@link Foo#member} */
+class Foo {
+    static member = 123;
+}
+`,
+			resolve: "none",
+			typ:     "any",
+		},
+		{
+			name: "hash link in see tag, both members",
+			content: `/** @see Foo#member */
+class Foo {
+    static member = 123;
+    member = 456;
+}
+`,
+			seeTag:  true,
+			resolve: "instance",
+			typ:     "any",
+		},
+		{
+			name: "dot link, both members, still uses the cache normally",
+			content: `/** {@link Foo.member} */
+class Foo {
+    static member = 123;
+    member = 456;
+}
+`,
+			resolve: "static",
+			typ:     "number",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fs := vfstest.FromMap(map[string]string{
+				"/foo.ts": tc.content,
+				"/tsconfig.json": `
+				{
+					"compilerOptions": {},
+					"files": ["foo.ts"]
+				}
+			`,
+			}, tspath.CaseInsensitive /*caseSensitivity*/)
+			fs = bundled.WrapFS(fs)
+
+			host := compiler.NewCompilerHost(fs, bundled.LibPath(), nil, nil, nil)
+			parsed, errors := tsoptions.GetParsedCommandLineOfConfigFile("/tsconfig.json", &core.CompilerOptions{}, nil, tsoptions.NewDefaultParseConfigHost(fs), nil)
+			assert.Equal(t, len(errors), 0, "Expected no errors in parsed command line")
+
+			p, err := compiler.NewProgram(t.Context(), compiler.ProgramOptions{
+				Config: parsed,
+				Host:   host,
+			})
+			assert.NilError(t, err)
+			p.BindSourceFiles()
+			c, done := p.GetTypeChecker(t.Context())
+			defer done()
+			file := p.GetSourceFile("/foo.ts")
+			decl := file.Statements.Nodes[0]
+			jsdocs := decl.JSDoc(file)
+			assert.Equal(t, len(jsdocs), 1, "Expected one JSDoc comment")
+			jsdoc := jsdocs[0].AsJSDoc()
+			var linkName *ast.Node
+			if tc.seeTag {
+				for _, tag := range jsdoc.Tags.Nodes {
+					if tag.Kind == ast.KindJSDocSeeTag {
+						if nameExpr := tag.AsJSDocSeeTag().NameExpression; nameExpr != nil {
+							linkName = nameExpr.AsJSDocNameReference().Name()
+						}
+					}
+				}
+			} else {
+				for _, commentPart := range jsdoc.Comment.Nodes {
+					if commentPart.Kind == ast.KindJSDocLink {
+						linkName = commentPart.AsJSDocLink().Name()
+					}
+				}
+			}
+			assert.Assert(t, linkName != nil, "Expected a link name to resolve")
+			assert.Assert(t, ast.IsQualifiedName(linkName), "Expected link name to be a qualified name")
+			right := linkName.AsQualifiedName().Right
+
+			// Ask for the type first, on both the whole link name and its
+			// right side, the way a language service would.
+			linkType := c.GetTypeAtLocation(linkName)
+			assert.Assert(t, linkType != nil, "Expected a type for the link name")
+			assert.Equal(t, c.TypeToString(linkType), tc.typ, "Unexpected type for the link name")
+			linkTypeFromRight := c.GetTypeAtLocation(right)
+			assert.Assert(t, linkTypeFromRight != nil, "Expected a type for the right side of the link name")
+
+			// The symbol query must give the same answer as without the
+			// type query first.
+			symbol := c.GetSymbolAtLocation(right)
+			switch tc.resolve {
+			case "none":
+				assert.Assert(t, symbol == nil, "Expected the link to resolve to nothing, got %v", symbol)
+			default:
+				assert.Assert(t, symbol != nil, "Expected the link to resolve to a symbol after GetTypeAtLocation")
+				assert.Equal(t, len(symbol.Declarations()), 1, "Expected the link to resolve to a single declaration")
+				isStatic := ast.HasSyntacticModifier(symbol.Declarations()[0], ast.ModifierFlagsStatic)
+				if tc.resolve == "static" {
+					assert.Assert(t, isStatic, "Expected the link to resolve to the static member")
+				} else {
+					assert.Assert(t, !isStatic, "Expected the link to resolve to the instance member")
+				}
+			}
+
+			// And the reverse order, symbol first then type, agrees too.
+			symbolFirst := c.GetSymbolAtLocation(right)
+			if tc.resolve == "none" {
+				assert.Assert(t, symbolFirst == nil, "Expected the link to resolve to nothing")
+			} else {
+				assert.Assert(t, symbolFirst != nil, "Expected the link to resolve to a symbol")
+				assert.Equal(t, symbolFirst, symbol, "Expected the symbol to be the same in both orders")
+			}
+			assert.Equal(t, c.TypeToString(c.GetTypeAtLocation(linkName)), tc.typ, "Unexpected type for the link name in symbol-first order")
+		})
+	}
+}
+
 func TestGetSymbolAtLocationJSDocHashLinkEdges(t *testing.T) {
 	t.Parallel()
 
